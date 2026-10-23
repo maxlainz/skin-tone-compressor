@@ -1,0 +1,31 @@
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy==2.2.6
+      - run: python3 tools/verify.py
+      - name: Check the DCTL header matches the tag
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          head -1 dctl/SkinToneCompressor.dctl | grep -qx "// Skin Tone Compressor $v" \
+            || { echo "header does not say $v"; exit 1; }
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ || /^\[[^]]+\]: / {f=0} f' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "no CHANGELOG section for $GITHUB_REF_NAME"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" dctl/SkinToneCompressor.dctl --title "$GITHUB_REF_NAME" --notes-file notes.md

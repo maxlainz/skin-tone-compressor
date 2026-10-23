@@ -1,0 +1,416 @@
+// Skin Tone Compressor 1.0.0
+// Copyright (C) 2026 Max Lainz
+// SPDX-License-Identifier: GPL-3.0-or-later
+// This program is free software: you can redistribute it and/or modify it under the terms of the
+// GNU General Public License as published by the Free Software Foundation, version 3 or later.
+// It comes WITHOUT ANY WARRANTY; see the LICENSE file or <https://www.gnu.org/licenses/>.
+//
+// Elastic skin tone compressor in Oklab: pulls the hue and chroma of colours near
+// skin towards a target skin line with a smooth, monotonic remap (no masks, no
+// inversions). Oklab L is never modified. Input and output are in the same
+// working space (ACEScct, ACEScc, DaVinci Intermediate, ARRI LogC4, Rec.709, sRGB).
+//   Target   - where skin goes: hue and chroma, both following luma around a pivot.
+//   Zone     - which pixels are affected: soft hue, chroma and luma ranges.
+//   Strength - how hard: hue and chroma strength, chroma lift, tolerance.
+//   Lips     - narrows the red side of the zone for saturated colours (lips, blush).
+//   Zone Hue Edge - near the target the zone switches to the full Yellow or Red range
+//                   (0 = smooth sine blend); the opposite hue keeps the smooth blend.
+// Alpha out = zone weight (use OFX Alpha + Highlight to see the key).
+// Show Shift = false colour of how far each pixel moves (R hue, G chroma).
+// Documentation: https://github.com/maxlainz/skin-tone-compressor
+
+DEFINE_DCTL_ALPHA_MODE_STRAIGHT
+
+DEFINE_UI_PARAMS(workingSpace,     Working Space,                  DCTLUI_COMBO_BOX, 0, { WS_ACESCCT, WS_ACESCC, WS_DWG, WS_LOGC4, WS_REC709, WS_SRGB }, { ACEScct, ACEScc, DaVinci Intermediate, ARRI LogC4, Rec.709 Gamma 2.4, sRGB })
+DEFINE_UI_PARAMS(targetHue,        Target Hue deg,                 DCTLUI_SLIDER_FLOAT, 47.0, 0.0, 360.0, 0.1)
+DEFINE_UI_PARAMS(targetHueTilt,    Target Hue Tilt vs Luma deg,    DCTLUI_SLIDER_FLOAT, 12.0, -60.0, 60.0, 0.5)
+DEFINE_UI_PARAMS(targetChroma,     Target Chroma,                  DCTLUI_SLIDER_FLOAT, 0.06, 0.01, 0.2, 0.001)
+DEFINE_UI_PARAMS(targetChromaTilt, Target Chroma Tilt vs Luma pct, DCTLUI_SLIDER_FLOAT, 60.0, -150.0, 150.0, 1.0)
+DEFINE_UI_PARAMS(tiltPivot,        Tilt Pivot Luma,                DCTLUI_SLIDER_FLOAT, 0.6, 0.2, 1.0, 0.01)
+DEFINE_UI_PARAMS(zoneHueYellow,    Zone Hue Range Yellow deg,      DCTLUI_SLIDER_FLOAT, 45.0, 5.0, 180.0, 0.1)
+DEFINE_UI_PARAMS(zoneHueRed,       Zone Hue Range Red deg,         DCTLUI_SLIDER_FLOAT, 45.0, 5.0, 180.0, 0.1)
+DEFINE_UI_PARAMS(zoneHueEdge,      Zone Hue Edge,                  DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(zoneChromaMin,    Zone Chroma Min,                DCTLUI_SLIDER_FLOAT, 0.025, 0.001, 0.1, 0.001)
+DEFINE_UI_PARAMS(zoneChromaMax,    Zone Chroma Max,                DCTLUI_SLIDER_FLOAT, 0.35, 0.05, 0.5, 0.005)
+DEFINE_UI_PARAMS(zoneLumaWindow,   Zone Luma Window,               DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_PARAMS(zoneLumaMin,      Zone Luma Min,                  DCTLUI_SLIDER_FLOAT, 0.1, 0.0, 0.8, 0.01)
+DEFINE_UI_PARAMS(zoneLumaMax,      Zone Luma Max,                  DCTLUI_SLIDER_FLOAT, 1.1, 0.3, 1.5, 0.01)
+DEFINE_UI_PARAMS(hueStrength,      Hue Strength,                   DCTLUI_SLIDER_FLOAT, 0.5, 0.0, 0.99, 0.01)
+DEFINE_UI_PARAMS(chromaStrength,   Chroma Strength,                DCTLUI_SLIDER_FLOAT, 0.3, 0.0, 0.99, 0.01)
+DEFINE_UI_PARAMS(chromaLift,       Chroma Lift pct,                DCTLUI_SLIDER_FLOAT, 100.0, 0.0, 100.0, 1.0)
+DEFINE_UI_PARAMS(chromaTolerance,  Chroma Tolerance pct,           DCTLUI_SLIDER_FLOAT, 30.0, 0.0, 100.0, 1.0)
+DEFINE_UI_PARAMS(lipsProtect,      Lips Protect,                   DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(lipsChromaMin,    Lips Chroma Min,                DCTLUI_SLIDER_FLOAT, 0.1, 0.03, 0.4, 0.005)
+DEFINE_UI_PARAMS(mix,              Mix,                            DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(outputAlpha,      Output Zone Alpha,              DCTLUI_CHECK_BOX, 1)
+DEFINE_UI_PARAMS(showShift,        Show Shift,                     DCTLUI_CHECK_BOX, 0)
+
+// =====================================================================
+// Layer (a): log <-> linear, per working space
+// =====================================================================
+
+// ---------- ACEScct ----------
+// Academy S-2016-001, docs.acescentral.com/encodings/acescct/
+// The spec also clamps the decode to 65504 above; not clamped here.
+__DEVICE__ float cct_to_lin(float x) {
+    return (x > 0.155251141552511f) ? _exp2f(x * 17.52f - 9.72f)
+                                    : (x - 0.0729055341958355f) / 10.5402377416545f;
+}
+__DEVICE__ float lin_to_cct(float x) {
+    return (x <= 0.0078125f) ? 10.5402377416545f * x + 0.0729055341958355f
+                             : (_log2f(x) + 9.72f) / 17.52f;
+}
+
+// ---------- ACEScc ----------
+// Academy S-2014-003, docs.acescentral.com/encodings/acescc/
+// 2^-16 = 0.0000152587890625, 2^-15 = 0.000030517578125 (exact).
+// ACEScc is not invertible for lin <= 0: the official encode clamps every
+// lin <= 0 to the floor (log2(2^-16) + 9.72) / 17.52 = -0.3584474886. This is
+// the official encoding, not a mask; as a consequence Mix 0 is only bit-exact
+// for inputs above the floor.
+__DEVICE__ float cc_to_lin(float x) {
+    if (x <= -0.3013698630136986f)                       // (9.72 - 15) / 17.52
+        return (_exp2f(x * 17.52f - 9.72f) - 0.0000152587890625f) * 2.0f;
+    if (x < 1.4679963120447153f)                         // (log2(65504) + 9.72) / 17.52
+        return _exp2f(x * 17.52f - 9.72f);
+    return 65504.0f;
+}
+__DEVICE__ float lin_to_cc(float x) {
+    if (x <= 0.0f)
+        return -0.3584474885844748f;                     // (log2(2^-16) + 9.72) / 17.52
+    if (x < 0.000030517578125f)
+        return (_log2f(0.0000152587890625f + x * 0.5f) + 9.72f) / 17.52f;
+    return (_log2f(x) + 9.72f) / 17.52f;
+}
+
+// ---------- DaVinci Intermediate ----------
+// Blackmagic Design, "DaVinci Wide Gamut / DaVinci Intermediate", rev 1.1, 2021-07-31.
+// Reference: 0.18 -> 0.336043, 1.0 -> 0.513837, 100 -> 1.000000.
+#define DI_A        0.0075f
+#define DI_B        7.0f
+#define DI_C        0.07329248f
+#define DI_M        10.44426855f
+#define DI_LIN_CUT  0.00262409f
+#define DI_LOG_CUT  0.02740668f
+__DEVICE__ float di_to_lin(float x) {
+    return (x > DI_LOG_CUT) ? _exp2f(x / DI_C - DI_B) - DI_A
+                            : x / DI_M;
+}
+__DEVICE__ float lin_to_di(float x) {
+    return (x > DI_LIN_CUT) ? (_log2f(x + DI_A) + DI_B) * DI_C
+                            : x * DI_M;
+}
+
+// ---------- ARRI LogC4 ----------
+// ARRI, "LogC4 Logarithmic Color Space Specification", 2022-09, rev 2025-01-23, Eq. 1-3.
+//   a = (2^18 - 16) / 117.45                 = 2231.826309067688
+//   b = (1023 - 95) / 1023                   = 0.9071358748778103
+//   c = 95 / 1023                            = 0.09286412512218964
+//   s = 7 ln2 * 2^(7 - 14 c / b) / (a b)     = 0.1135972086105891
+//   t = (2^(14 (-c / b) + 6) - 64) / a       = -0.01805699611991131
+// The decode linear segment starts at 0 in the ENCODED domain (f(t) = 0).
+// Reference: f(0) = 0.0929, f(0.18) = 0.2784.
+#define LC4_A  2231.826309067688f
+#define LC4_B  0.9071358748778103f
+#define LC4_C  0.09286412512218964f
+#define LC4_S  0.1135972086105891f
+#define LC4_T  (-0.01805699611991131f)
+__DEVICE__ float logc4_to_lin(float x) {
+    return (x >= 0.0f) ? (_exp2f(14.0f * (x - LC4_C) / LC4_B + 6.0f) - 64.0f) / LC4_A
+                       : x * LC4_S + LC4_T;
+}
+__DEVICE__ float lin_to_logc4(float x) {
+    return (x >= LC4_T) ? (_log2f(LC4_A * x + 64.0f) - 6.0f) / 14.0f * LC4_B + LC4_C
+                        : (x - LC4_T) / LC4_S;
+}
+
+// ---------- Rec.709 Gamma 2.4 ----------
+// ITU-R BT.1886 EOTF with black level 0 (L = V^2.4), ITU-R BT.709 primaries.
+// Mirrored about 0 (odd function): invertible and strictly increasing on all of R.
+__DEVICE__ float r709_to_lin(float x) { return _copysignf(_powf(_fabs(x), 2.4f), x); }
+__DEVICE__ float lin_to_r709(float x) { return _copysignf(_powf(_fabs(x), 1.0f / 2.4f), x); }
+
+// ---------- sRGB ----------
+// IEC 61966-2-1:1999 piecewise transfer function, mirrored about 0 (odd).
+__DEVICE__ float srgb_to_lin(float x) {
+    return (_fabs(x) <= 0.04045f) ? x / 12.92f
+                                  : _copysignf(_powf((_fabs(x) + 0.055f) / 1.055f, 2.4f), x);
+}
+__DEVICE__ float lin_to_srgb(float x) {
+    return (_fabs(x) <= 0.0031308f) ? 12.92f * x
+                                    : _copysignf(1.055f * _powf(_fabs(x), 1.0f / 2.4f) - 0.055f, x);
+}
+
+__DEVICE__ float3 decode_log(float3 c, int ws) {
+    if (ws == WS_ACESCC)
+        return make_float3(cc_to_lin(c.x), cc_to_lin(c.y), cc_to_lin(c.z));
+    else if (ws == WS_DWG)
+        return make_float3(di_to_lin(c.x), di_to_lin(c.y), di_to_lin(c.z));
+    else if (ws == WS_LOGC4)
+        return make_float3(logc4_to_lin(c.x), logc4_to_lin(c.y), logc4_to_lin(c.z));
+    else if (ws == WS_REC709)
+        return make_float3(r709_to_lin(c.x), r709_to_lin(c.y), r709_to_lin(c.z));
+    else if (ws == WS_SRGB)
+        return make_float3(srgb_to_lin(c.x), srgb_to_lin(c.y), srgb_to_lin(c.z));
+    else
+        return make_float3(cct_to_lin(c.x), cct_to_lin(c.y), cct_to_lin(c.z));
+}
+__DEVICE__ float3 encode_log(float3 c, int ws) {
+    if (ws == WS_ACESCC)
+        return make_float3(lin_to_cc(c.x), lin_to_cc(c.y), lin_to_cc(c.z));
+    else if (ws == WS_DWG)
+        return make_float3(lin_to_di(c.x), lin_to_di(c.y), lin_to_di(c.z));
+    else if (ws == WS_LOGC4)
+        return make_float3(lin_to_logc4(c.x), lin_to_logc4(c.y), lin_to_logc4(c.z));
+    else if (ws == WS_REC709)
+        return make_float3(lin_to_r709(c.x), lin_to_r709(c.y), lin_to_r709(c.z));
+    else if (ws == WS_SRGB)
+        return make_float3(lin_to_srgb(c.x), lin_to_srgb(c.y), lin_to_srgb(c.z));
+    else
+        return make_float3(lin_to_cct(c.x), lin_to_cct(c.y), lin_to_cct(c.z));
+}
+
+// =====================================================================
+// Layers (b)+(c): matrices
+// ---- generated by tools/gen_matrices.py; do not edit by hand ----
+// Sources are listed in tools/gen_matrices.py (AP1: ACES docs; DWG: BMD
+// whitepaper rev 1.1; AWG4: ARRI LogC4 spec Eq. 5a; Rec.709 / sRGB: ITU-R
+// BT.709-6 = IEC 61966-2-1; Bradford: Lam 1985; Oklab: bottosson.github.io/posts/oklab/). Each `// MAT NAME` line is followed
+// by exactly 3 rows of 3 terms; tools/verify.py parses them.
+// =====================================================================
+
+// ACES AP1 (ACEScct / ACEScc): RGB -> XYZ(D65) [Bradford (0.32168, 0.33767) -> D65] and inverse
+__DEVICE__ float3 mat_ap1_to_xyz(float3 c) {
+    return make_float3(
+// MAT AP1_TO_XYZ
+    0.6522375419f * c.x +0.128236136f * c.y +0.1699822492f * c.z,
+    0.2676721801f * c.x +0.6743399888f * c.y +0.05798783107f * c.z,
+    -0.005381815766f * c.x +0.001369060209f * c.y +1.093070506f * c.z);
+}
+__DEVICE__ float3 mat_xyz_to_ap1(float3 c) {
+    return make_float3(
+// MAT XYZ_TO_AP1
+    1.660585326f * c.x -0.3152955608f * c.y -0.2415093276f * c.z,
+    -0.6599260632f * c.x +1.60839147f * c.y +0.01729859471f * c.z,
+    0.009002569138f * c.x -0.00356687639f * c.y +0.9136433128f * c.z);
+}
+// DaVinci Wide Gamut: RGB -> XYZ(D65) [no CAT, native D65] and inverse
+__DEVICE__ float3 mat_dwg_to_xyz(float3 c) {
+    return make_float3(
+// MAT DWG_TO_XYZ
+    0.7006223921f * c.x +0.1487748151f * c.y +0.1010587198f * c.z,
+    0.2741185109f * c.x +0.8736318959f * c.y -0.1477504068f * c.z,
+    -0.09896291288f * c.x -0.1378953251f * c.y +1.325915989f * c.z);
+}
+__DEVICE__ float3 mat_xyz_to_dwg(float3 c) {
+    return make_float3(
+// MAT XYZ_TO_DWG
+    1.516672042f * c.x -0.2814780479f * c.y -0.1469636332f * c.z,
+    -0.4649171012f * c.x +1.251423776f * c.y +0.1748846089f * c.z,
+    0.06484904707f * c.x +0.1091393437f * c.y +0.7614146215f * c.z);
+}
+// ARRI Wide Gamut 4: RGB -> XYZ(D65) [no CAT, native D65] and inverse
+__DEVICE__ float3 mat_awg4_to_xyz(float3 c) {
+    return make_float3(
+// MAT AWG4_TO_XYZ
+    0.7048583204f * c.x +0.1297602952f * c.y +0.1158373115f * c.z,
+    0.2545241764f * c.x +0.7814777327f * c.y -0.03600190912f * c.z,
+    0.0f * c.x +0.0f * c.y +1.089057751f * c.z);
+}
+__DEVICE__ float3 mat_xyz_to_awg4(float3 c) {
+    return make_float3(
+// MAT XYZ_TO_AWG4
+    1.509215472f * c.x -0.2505973452f * c.y -0.1688114753f * c.z,
+    -0.4915454517f * c.x +1.361245546f * c.y +0.09728294201f * c.z,
+    0.0f * c.x +0.0f * c.y +0.9182249512f * c.z);
+}
+// Rec.709 / sRGB: RGB -> XYZ(D65) [no CAT, native D65] and inverse
+__DEVICE__ float3 mat_rec709_to_xyz(float3 c) {
+    return make_float3(
+// MAT REC709_TO_XYZ
+    0.4123907993f * c.x +0.3575843394f * c.y +0.1804807884f * c.z,
+    0.2126390059f * c.x +0.7151686788f * c.y +0.07219231536f * c.z,
+    0.01933081872f * c.x +0.1191947798f * c.y +0.9505321522f * c.z);
+}
+__DEVICE__ float3 mat_xyz_to_rec709(float3 c) {
+    return make_float3(
+// MAT XYZ_TO_REC709
+    3.240969942f * c.x -1.537383178f * c.y -0.4986107603f * c.z,
+    -0.9692436363f * c.x +1.875967502f * c.y +0.04155505741f * c.z,
+    0.0556300797f * c.x -0.2039769589f * c.y +1.056971514f * c.z);
+}
+
+__DEVICE__ float3 rgb_to_xyz(float3 c, int ws) {
+    if (ws == WS_DWG)        return mat_dwg_to_xyz(c);
+    else if (ws == WS_LOGC4) return mat_awg4_to_xyz(c);
+    else if (ws == WS_REC709) return mat_rec709_to_xyz(c);
+    else if (ws == WS_SRGB)  return mat_rec709_to_xyz(c);  // sRGB shares the Rec.709 primaries
+    else                     return mat_ap1_to_xyz(c);     // ACEScct and ACEScc share AP1
+}
+__DEVICE__ float3 xyz_to_rgb(float3 c, int ws) {
+    if (ws == WS_DWG)        return mat_xyz_to_dwg(c);
+    else if (ws == WS_LOGC4) return mat_xyz_to_awg4(c);
+    else if (ws == WS_REC709) return mat_xyz_to_rec709(c);
+    else if (ws == WS_SRGB)  return mat_xyz_to_rec709(c);
+    else                     return mat_xyz_to_ap1(c);
+}
+
+// ---------- Oklab (XYZ D65), Ottosson's published M1, M2 and M2^-1 ----------
+__DEVICE__ float scbrt(float x) { return _copysignf(_powf(_fabs(x), 1.0f / 3.0f), x); }
+// softplus, overflow-safe: k*ln(1+exp(x/k)) == max(x,0) + k*ln(1+exp(-|x|/k))
+__DEVICE__ float softplus(float x, float k) { return _fmaxf(x, 0.0f) + k * _logf(1.0f + _expf(-_fabs(x) / k)); }
+
+__DEVICE__ float3 mat_oklab_m1(float3 c) {
+    return make_float3(
+// MAT OKLAB_M1
+    0.8189330101f * c.x +0.3618667424f * c.y -0.1288597137f * c.z,
+    0.0329845436f * c.x +0.9293118715f * c.y +0.0361456387f * c.z,
+    0.0482003018f * c.x +0.2643662691f * c.y +0.6338517070f * c.z);
+}
+__DEVICE__ float3 mat_oklab_m2(float3 c) {
+    return make_float3(
+// MAT OKLAB_M2
+    0.2104542553f * c.x +0.7936177850f * c.y -0.0040720468f * c.z,
+    1.9779984951f * c.x -2.4285922050f * c.y +0.4505937099f * c.z,
+    0.0259040371f * c.x +0.7827717662f * c.y -0.8086757660f * c.z);
+}
+__DEVICE__ float3 mat_oklab_m2_inv(float3 c) {
+    return make_float3(
+// MAT OKLAB_M2_INV
+    1.0f * c.x +0.3963377774f * c.y +0.2158037573f * c.z,
+    1.0f * c.x -0.1055613458f * c.y -0.0638541728f * c.z,
+    1.0f * c.x -0.0894841775f * c.y -1.2914855480f * c.z);
+}
+// Oklab M1^-1 (LMS -> XYZ D65), float64 inverse of the published M1
+__DEVICE__ float3 mat_oklab_m1_inv(float3 c) {
+    return make_float3(
+// MAT OKLAB_M1_INV
+    1.227013851f * c.x -0.5577999807f * c.y +0.281256149f * c.z,
+    -0.04058017842f * c.x +1.11225687f * c.y -0.07167667867f * c.z,
+    -0.07638128451f * c.x -0.4214819784f * c.y +1.58616322f * c.z);
+}
+
+__DEVICE__ float3 xyz_to_oklab(float3 c) {
+    float3 lms = mat_oklab_m1(c);
+    lms = make_float3(scbrt(lms.x), scbrt(lms.y), scbrt(lms.z));
+    return mat_oklab_m2(lms);
+}
+__DEVICE__ float3 oklab_to_xyz(float3 lab) {
+    float3 lms = mat_oklab_m2_inv(lab);
+    lms = make_float3(lms.x * lms.x * lms.x, lms.y * lms.y * lms.y, lms.z * lms.z * lms.z);
+    return mat_oklab_m1_inv(lms);
+}
+__DEVICE__ float3 rgb_to_oklab(float3 c, int ws)   { return xyz_to_oklab(rgb_to_xyz(c, ws)); }
+__DEVICE__ float3 oklab_to_rgb(float3 lab, int ws) { return xyz_to_rgb(oklab_to_xyz(lab), ws); }
+
+// ---------- Hue remap ----------
+// d = signed hue distance to target (rad). Periodic von Mises-shaped attractor:
+//   d' = d - strength * sin(d) * exp(kappa(d) * (cos(d) - 1))
+// kappa(d) = 1 / w(d)^2, w(d) = wR + (wY - wR) * sigma(d): smooth periodic blend of the
+// widths (Yellow at d = +90 deg, Red at -90 deg). At Zone Hue Edge 0, sigma = sig0 =
+// 0.5 * (1 + sin d), the smooth sine blend. With s = 16 * Zone Hue Edge > 0:
+//   sigS  = 0.5 * (1 + tanh(s sin d) / tanh(s))   sharp switch (-> sig0 as s -> 0)
+//   m     = 0.5 * (1 + cos d)                     window: 1 at the target, 0 opposite it
+//   sigma = sig0 + m * (sigS - sig0)              convex blend, in [0, 1], C-infinity, periodic
+// Within a few degrees of the target the blend switches to the full Yellow or Red width
+// (transition ~ +-3/s rad); the window confines the sharpening to the target side, so the
+// opposite hue keeps the smooth sine blend. Slope >= 1 - strength.
+__DEVICE__ float remap_hue(float h, float target, float wY, float wR, float s, float str) {
+    float d = h - target;
+    d = d - 6.283185307f * _round(d / 6.283185307f);   // wrap to [-pi, pi]
+    // 1 towards yellow (+90 deg), 0 towards red (-90 deg); s > 0 is a UI-parameter branch, uniform: not a mask
+    float sigma = (s > 0.0f) ? 0.5f * (1.0f + _sinf(d)) + 0.5f * (1.0f + _cosf(d)) * (0.5f * (1.0f + _tanhf(s * _sinf(d)) / _tanhf(s)) - 0.5f * (1.0f + _sinf(d))) : 0.5f * (1.0f + _sinf(d));
+    float w = wR + (wY - wR) * sigma;                  // smooth periodic width blend (see above)
+    float kappa = 1.0f / (w * w);
+    float dn = d - str * _sinf(d) * _expf(kappa * (_cosf(d) - 1.0f));
+    return target + dn;
+}
+
+__DEVICE__ float4 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B, float p_A)
+{
+    int ws = workingSpace;
+    float3 lin = decode_log(make_float3(p_R, p_G, p_B), ws);
+    float3 lab = rgb_to_oklab(lin, ws);
+
+    float C = _sqrtf(lab.y * lab.y + lab.z * lab.z);
+    // at C == 0 the output is (L, 0, 0) for any h, so this guard is numerical, not a mask
+    float h = (C > 0.0f) ? _atan2f(lab.z, lab.y) : 0.0f;
+
+    // --- weight field over (L, C): smooth, no hard edges ---
+    float C2 = C * C;
+    float k2 = zoneChromaMin * zoneChromaMin;
+    float wKnee = (k2 > 0.0f) ? C2 / (C2 + k2) : 1.0f;              // Zone Chroma Min (knee): rises from 0 at neutral
+    float r4 = (C / zoneChromaMax); r4 = r4 * r4; r4 = r4 * r4;
+    float wCeil = 1.0f / (1.0f + r4);                                  // Zone Chroma Max (ceiling): falls past it
+    float Lc     = lab.x - softplus(lab.x - 1.2f, 0.05f) + softplus(-lab.x, 0.05f);   // C-inf clamp to [0, 1.2], identity inside
+
+    // Zone Luma Window over Lc (> 0): order-8 rational knee and ceiling, 0.5 at each edge
+    float L8 = Lc * Lc; L8 = L8 * L8; L8 = L8 * L8;
+    float m8 = zoneLumaMin * zoneLumaMin; m8 = m8 * m8; m8 = m8 * m8;
+    float wLKnee = (m8 > 0.0f) ? L8 / (L8 + m8) : 1.0f;              // Zone Luma Min: rises past it
+    float rL = Lc / _fmaxf(zoneLumaMax, 0.01f); rL = rL * rL; rL = rL * rL; rL = rL * rL;
+    float wLCeil = 1.0f / (1.0f + rL);                                 // Zone Luma Max: falls past it
+    float wL = zoneLumaWindow ? wLKnee * wLCeil : 1.0f;                // UI int branch, uniform: not a mask
+
+    // lips protection: chroma factor cL rises past Lips Chroma Min; it narrows the red range below
+    float rC     = C / _fmaxf(lipsChromaMin, 0.001f); rC = rC * rC;
+    float cL     = 1.0f - 1.0f / (1.0f + rC);                          // = C^2 / (C^2 + min^2), overflow-safe
+
+    float wField = wKnee * wCeil * wL;
+    float wgt = _fminf(hueStrength * wField, 0.99f);
+
+    // --- target hue tilts with Oklab L around the pivot (default mid-tone skin L ~ 0.6) ---
+    float target = (targetHue + targetHueTilt * (Lc - tiltPivot)) * 0.01745329252f;
+    // Zone Hue Range widths clamped to [1, 180] deg: beyond ~450 deg the blended remap would invert
+    float wY     = _fminf(_fmaxf(zoneHueYellow, 1.0f), 180.0f) * 0.01745329252f;   // kernel width towards yellow (d = +90 deg)
+    // Lips Protect shrinks the (clamped) red width for saturated colours, never by more than 90 % (like the 0.99 clamps)
+    float wR     = _fminf(_fmaxf(zoneHueRed, 1.0f), 180.0f) * (1.0f - 0.9f * lipsProtect * cL) * 0.01745329252f;   // kernel width towards red (d = -90 deg)
+
+    // --- hue kernel at the ORIGINAL hue (same von Mises shape as the remap) ---
+    float d = h - target;
+    d = d - 6.283185307f * _round(d / 6.283185307f);
+    // smooth periodic width blend (same as remap_hue): C-infinity, no seam at d = +-pi.
+    // Zone Hue Edge sharpens it on the target side only (window (1 + cos d)/2, see remap_hue): s = 16 * edge;
+    // s > 0 is a UI-parameter branch, uniform: not a mask
+    float s = 16.0f * zoneHueEdge;
+    float sigma = (s > 0.0f) ? 0.5f * (1.0f + _sinf(d)) + 0.5f * (1.0f + _cosf(d)) * (0.5f * (1.0f + _tanhf(s * _sinf(d)) / _tanhf(s)) - 0.5f * (1.0f + _sinf(d))) : 0.5f * (1.0f + _sinf(d));
+    float w  = wR + (wY - wR) * sigma;
+    float kH = _expf((_cosf(d) - 1.0f) / (w * w));                 // 1 on the skin line, -> 0 away
+    float wC = _fminf(chromaStrength * wField * kH, 0.99f);
+
+    // zone weight in [0, 1]: chroma field (Zone Chroma Min / Max) times the hue kernel.
+    // Independent of Hue / Chroma Strength and of Mix; no 0.99 clamp (it is not a slope).
+    float a = wField * kH;
+    float alphaOut = outputAlpha ? a * p_A : p_A;                      // zone x input alpha (keeps an upstream key); UI int branch, uniform: not a mask
+
+    float hn = remap_hue(h, target, wY, wR, s, wgt);
+
+    // --- chroma compression towards targetChroma (log domain, soft tolerance (deadband), tanh-bounded) ---
+    // the target follows L around the same pivot as the hue tilt:
+    // effective target = targetChroma * exp(k * (Lc - pivot)), k = targetChromaTilt / 100, always > 0
+    float u     = _logf(_fmaxf(C, 1e-12f) / targetChroma) - (targetChromaTilt * 0.01f) * (Lc - tiltPivot);
+    float delta = _logf(1.0f + chromaTolerance * 0.01f);   // tolerance (deadband)
+    // clamp the tanh argument for fast-math backends; tanh(20) == 1 in float32, so no behaviour change
+    float f     = (delta > 1e-4f) ? u - delta * _tanhf(_clampf(u / delta, -20.0f, 20.0f)) : u;
+    // Chroma Lift: full strength pulling down (th > 0), strength * lift pulling up; g == th at lift 100.
+    // lc = eps * ln cosh(th / eps), a smooth |th| (eps = 0.05, overflow-safe form, ln 2 = 0.6931471806)
+    float th    = _tanhf(f);
+    float lift  = chromaLift * 0.01f;
+    float xl    = _fabs(th) / 0.05f;
+    float lc    = 0.05f * (xl + _logf(1.0f + _expf(-2.0f * xl)) - 0.6931471806f);
+    float g     = 0.5f * (1.0f + lift) * th + 0.5f * (1.0f - lift) * lc;
+    float Cn    = C * _expf(-wC * g);
+
+    float3 labn = make_float3(lab.x, Cn * _cosf(hn), Cn * _sinf(hn));
+    labn = lab + (labn - lab) * mix;                                   // mix in Oklab: L stays exact
+    float3 outl = lin + (oklab_to_rgb(labn, ws) - oklab_to_rgb(lab, ws));   // exact bypass at mix 0; round-trip bias cancels
+
+    // Show Shift: false colour of the move, raw codes (no encode_log)
+    float dh   = hn - h;  dh = dh - 6.283185307f * _round(dh / 6.283185307f);   // signed hue shift (rad), wrapped
+    float dlnC = -wC * g;                                                       // signed log chroma ratio ln(Cn / C)
+    float3 shift = make_float3(0.5f + dh * 57.29577951f / 60.0f * mix,          // R: hue shift, +-30 deg -> 0..1
+                               0.5f + dlnC * mix,                               // G: chroma shift, ln ratio (+-0.5 -> 0..1)
+                               0.5f);                                           // B: flat mid grey
+    float3 rgb = showShift ? shift : encode_log(outl, ws);                      // UI int branch, uniform: not a mask
+    return make_float4(rgb.x, rgb.y, rgb.z, alphaOut);
+}

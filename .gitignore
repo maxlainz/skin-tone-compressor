@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Footage, LUTs and renders never enter the repo
+*.cube
+*.clf
+*.exr
+*.dpx
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+*.mov
+*.mxf
+*.mp4
+*.braw
+*.r3d
+*.ari
+*.dng
+*.drx
+*.drp
+reports/
+samples/
+scratch/
+
+# macOS / editors
+.DS_Store
